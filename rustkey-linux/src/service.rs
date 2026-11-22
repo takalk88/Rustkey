@@ -288,7 +288,11 @@ impl IBusService {
                 if !engine_known(&name) {
                     return Err(Fail(INVALID_ARGS, format!("no such engine: {name}")));
                 }
-                self.set_global(bus, &name);
+                // Cinnamon has no input-source panel and its clients reset the engine to
+                // xkb:us::eng; Rustkey stays selected, VN/EN is the engine's own toggle.
+                if name == ENGINE_RUSTKEY {
+                    self.set_global(bus, &name);
+                }
                 bus.reply(IBUS_NAME, m, "", &[]);
             }
             "GetGlobalEngine" => {
@@ -706,6 +710,9 @@ impl IBusService {
 
     fn set_global(&mut self, bus: &mut Bus, name: &str) {
         self.config.refresh();
+        if self.debug {
+            eprintln!("rustkey-linux: set_global {name}");
+        }
         self.global = name.to_string();
         let paths: Vec<String> = self.ctxs.keys().cloned().collect();
         for p in paths {

@@ -42,9 +42,16 @@ pub fn machine_id() -> String {
 
 /// WAYLAND_DISPLAY if set, else DISPLAY, as ibus does.
 pub fn display_name(wayland: Option<OsString>, x11: Option<OsString>) -> String {
+    // ibus names the file by display number: ":0.0" -> "0"; a Wayland name is kept whole.
     wayland
-        .or(x11)
         .map(|s| s.to_string_lossy().into_owned())
+        .or_else(|| {
+            x11.map(|s| {
+                let s = s.to_string_lossy();
+                let n = s.rsplit_once(':').map_or(&*s, |(_, n)| n);
+                n.split('.').next().unwrap_or(n).to_string()
+            })
+        })
         .unwrap_or_default()
 }
 
