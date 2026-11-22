@@ -21,6 +21,7 @@ const PURPOSE_TERMINAL: u32 = 10;
 /// Words a non-URL field remembers per key, see `track_key`.
 const WORD_STATES_MAX: usize = 32;
 
+const SHIFT_MASK: u32 = 1;
 const CONTROL_MASK: u32 = 1 << 2;
 const MOD1_MASK: u32 = 1 << 3; // Alt
 const MOD4_MASK: u32 = 1 << 6; // Super on most layouts
@@ -170,8 +171,8 @@ pub struct Ime {
     dot_pending: bool,
     /// The last letter committed was an auto-capital that starts the word being typed.
     word_cap: bool,
-    /// Whether the config enables the Ctrl+Shift toggle.
-    toggle_enabled: bool,
+    /// The toggle shortcut the config selects.
+    toggle: ToggleShortcut,
     mode: Mode,
     caps: u32,
     purpose: u32,
@@ -347,7 +348,7 @@ impl Ime {
         Ime {
             telex: Telex::new(cfg.telex.clone()),
             chord: Chord::default(),
-            toggle_enabled: cfg.toggle_shortcut == ToggleShortcut::CtrlShift,
+            toggle: cfg.toggle_shortcut,
             auto_cap: cfg.auto_capitalize,
             sentence: Sentence::Unknown,
             dot_pending: false,
@@ -406,7 +407,7 @@ impl Ime {
     }
 
     pub(crate) fn apply_config(&mut self, cfg: &Config) {
-        self.toggle_enabled = cfg.toggle_shortcut == ToggleShortcut::CtrlShift;
+        self.toggle = cfg.toggle_shortcut;
         self.auto_cap = cfg.auto_capitalize;
         if self.telex.is_empty() && !self.preedit_visible {
             self.pending_cfg = None;
@@ -633,8 +634,19 @@ impl Ime {
         out: &mut Vec<Out>,
     ) -> bool {
         // The chord is tracked even while Vietnamese is off, so the toggle can turn it back on.
-        if self.chord.observe(keyval, state) && self.toggle_enabled {
+        if self.chord.observe(keyval, state) && self.toggle == ToggleShortcut::CtrlShift {
             out.push(Out::ToggleVietnamese);
+        }
+        // Ctrl+Space: fires on the press, and the press and its release never reach the app.
+        if self.toggle == ToggleShortcut::CtrlSpace
+            && keyval == 0x20
+            && state & CONTROL_MASK != 0
+            && state & (SHIFT_MASK | OTHER_MODS) == 0
+        {
+            if state & RELEASE_MASK == 0 {
+                out.push(Out::ToggleVietnamese);
+            }
+            return true;
         }
         let shortcut = CONTROL_MASK | MOD1_MASK | MOD4_MASK | SUPER_MASK | HYPER_MASK | META_MASK;
         let pressed = state & RELEASE_MASK == 0 && !is_modifier_key(keyval);
@@ -1445,6 +1457,20 @@ mod tests {
         let handled = ime.process_key('w' as u32, 0, 0, &mut out);
         assert!(!handled);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ctrl_space_toggles_and_is_swallowed() {
+        let mut ime = Ime::new(&crate::config::parse("toggle_shortcut = ctrl_space\n"));
+        let mut out = Vec::new();
+        assert!(ime.process_key(0x20, 0, CONTROL_MASK, &mut out));
+        assert!(ime.process_key(0x20, 0, CONTROL_MASK | RELEASE_MASK, &mut out));
+        assert_eq!(toggles(&out), 1);
+        // Ctrl+Shift does nothing in this mode; Ctrl+Shift+Space passes through.
+        assert_eq!(toggles(&press(&mut ime, KEY_CTRL_L)), 0);
+        assert_eq!(toggles(&ev(&mut ime, KEY_SHIFT_L, false, CONTROL_MASK)), 0);
+        assert_eq!(toggles(&ev(&mut ime, KEY_SHIFT_L, true, CONTROL_MASK | SHIFT_MASK)), 0);
+        assert_eq!(toggles(&ev(&mut ime, 0x20, false, CONTROL_MASK | SHIFT_MASK)), 0);
     }
 
     const KEY_CTRL_L: u32 = 0xffe3;

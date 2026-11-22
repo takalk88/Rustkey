@@ -6,6 +6,7 @@
 
 ### Thêm
 - Panel VN/EN trên Cinnamon: `install.sh` thêm rustkey lên đầu nguồn nhập (`org.cinnamon.desktop.input-sources`), giữ các nguồn cũ; applet bàn phím hiện VN/EN và menu bật/tắt, Telex/VNI. `uninstall.sh` gỡ nguồn này.
+- `toggle_shortcut = ctrl_space`: Ctrl+Space bật/tắt tiếng Việt; ứng dụng không nhận phím này.
 
 ## [0.2.2] - 2026-11-09
 

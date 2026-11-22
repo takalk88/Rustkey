@@ -26,6 +26,8 @@ pub(crate) enum Mode {
 pub(crate) enum ToggleShortcut {
     /// Press Ctrl and Shift together, then let go of one of them.
     CtrlShift,
+    /// Press Ctrl+Space; the app never sees it.
+    CtrlSpace,
     /// No shortcut: the panel menu is the only switch.
     Off,
 }
@@ -117,7 +119,7 @@ enable_macro = false
 # Nhớ trạng thái bật/tắt tiếng Việt theo từng ứng dụng (như EVKey)
 remember_state_per_app = true
 
-# Phím tắt bật/tắt tiếng Việt: ctrl_shift (nhấn Ctrl và Shift cùng lúc, rồi nhả một phím) | off
+# Phím tắt bật/tắt tiếng Việt: ctrl_shift (nhấn Ctrl và Shift cùng lúc, rồi nhả một phím) | ctrl_space | off
 toggle_shortcut = ctrl_shift
 
 # Từ tiếng Anh bổ sung (không bị bỏ dấu nhầm):
@@ -312,6 +314,7 @@ pub(crate) fn parse(text: &str) -> Config {
             "toggle_shortcut" => {
                 cfg.toggle_shortcut = match v.to_ascii_lowercase().as_str() {
                     "off" => ToggleShortcut::Off,
+                    "ctrl_space" => ToggleShortcut::CtrlSpace,
                     _ => ToggleShortcut::CtrlShift,
                 };
             }
