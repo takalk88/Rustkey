@@ -4,6 +4,9 @@
 
 ## [Chưa phát hành]
 
+### Thêm
+- Panel VN/EN trên Cinnamon: `install.sh` thêm rustkey lên đầu nguồn nhập (`org.cinnamon.desktop.input-sources`), giữ các nguồn cũ; applet bàn phím hiện VN/EN và menu bật/tắt, Telex/VNI. `uninstall.sh` gỡ nguồn này.
+
 ## [0.2.2] - 2026-11-09
 
 ### Sửa lỗi
