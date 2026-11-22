@@ -515,7 +515,12 @@ impl Ime {
             }
             let surrounding = self.caps & CAP_SURROUNDING_TEXT != 0 && self.surrounding_seen;
             self.show = if self.purpose == PURPOSE_TERMINAL {
-                Show::Preedit
+                // Only `mode = backspace` trades the underline for fake BackSpace keys here.
+                if self.mode == Mode::Backspace {
+                    Show::Backspace
+                } else {
+                    Show::Preedit
+                }
             } else {
                 match self.mode {
                     Mode::Preedit | Mode::Off => Show::Preedit,
@@ -940,6 +945,16 @@ mod tests {
         assert!(out.contains(&Out::ForwardBackspaces(1)));
         assert_eq!(out.last(), Some(&Out::Commit("ểm".into())));
         assert_eq!(out[out.len() - 2], Out::ForwardBackspaces(2));
+    }
+
+    #[test]
+    fn backspace_mode_covers_terminals_too() {
+        let cfg = crate::config::parse("mode = backspace\n");
+        let mut ime = Ime::new(&cfg);
+        ime.set_capabilities(0x9);
+        ime.set_content_type(0, PURPOSE_TERMINAL);
+        let out = keys(&mut ime, "kieemr");
+        assert!(!out.iter().any(|o| matches!(o, Out::Preedit(_))));
     }
 
     #[test]
