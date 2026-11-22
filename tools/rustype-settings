@@ -1,0 +1,1135 @@
+#!/usr/bin/env python3
+"""Rustype Settings: Native GNOME GTK4 + Libadwaita Preferences Window."""
+
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import threading
+import urllib.request
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+CONFIG_DIR = (
+    pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
+    / "rustype"
+)
+CONFIG_FILE = CONFIG_DIR / "config"
+MACRO_FILE = CONFIG_DIR / "macro"
+WORDS_FILE = CONFIG_DIR / "words"
+
+
+ENGINE_NAME = "rustype-linux"
+
+
+def find_engine():
+    """Returns the path of rustype-linux: PATH first, then the known install locations."""
+    exe = shutil.which(ENGINE_NAME)
+    if exe:
+        return exe
+    candidates = [
+        pathlib.Path("/usr/libexec/rustype-linux"),
+        pathlib.Path.home() / ".local" / "lib" / "rustype" / "rustype-linux",
+        pathlib.Path("/usr/local/libexec/rustype-linux"),
+        pathlib.Path(__file__).resolve().parent.parent / "target" / "release" / ENGINE_NAME,
+        pathlib.Path(__file__).resolve().parent / "target" / "release" / ENGINE_NAME,
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def get_installed_version() -> str:
+    """Detects the version from the installed rustype-linux or falls back to default."""
+    exe = find_engine()
+    if exe:
+        try:
+            res = subprocess.run(
+                [str(exe), "--version"], capture_output=True, text=True, timeout=2
+            )
+            for token in res.stdout.split():
+                if token and token[0].isdigit():
+                    return token.strip()
+        except Exception:
+            pass
+    return "0.2.2"
+
+
+def strip_comment(line: str) -> str:
+    """Drops a trailing '#' comment; a '#' inside double quotes is part of the value."""
+    in_quotes = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "#" and not in_quotes:
+            return line[:i]
+    return line
+
+
+def drop_macro_lines(text: str, key: str) -> str:
+    """Removes the lines whose macro key, parsed as load() does, equals key. Other lines stay."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        body = strip_comment(line.rstrip("\r\n")).strip()
+        if ":" in body and body.split(":", 1)[0].strip() == key:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def drop_word_lines(text: str, word: str) -> str:
+    """Removes the lines whose word, parsed as load() does, equals word. Other lines stay."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        if strip_comment(line.rstrip("\r\n")).strip() == word:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def rewrite_file(path: pathlib.Path, transform):
+    """Applies transform to the text of an existing file. Writes a sibling temp file, then renames
+    it over the target, following a symlink first, as the engine's config writer does. Returns None
+    on success or when the file is missing, otherwise the error text."""
+    if not path.exists():
+        return None
+    tmp = None
+    try:
+        target = path.resolve()
+        text = target.read_text(encoding="utf-8")
+        new = transform(text)
+        if new == text:
+            return None
+        tmp = target.with_name(f".{target.name}.tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, target)
+    except (OSError, UnicodeError) as e:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return str(e)
+    return None
+
+
+BOOL_OPTIONS = (
+    "modern_orthography",
+    "auto_restore_english",
+    "remember_state_per_app",
+    "enable_macro",
+    "free_tone_order",
+    "simple_telex",
+    "quick_telex",
+    "auto_capitalize",
+)
+
+
+def read_text_or_none(path: pathlib.Path):
+    """The text of path, or None when it cannot be read as UTF-8 text."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def unquote(text: str) -> str:
+    """Strips one pair of surrounding double quotes. Any other text is returned unchanged."""
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1]
+    return text
+
+
+def parse_bool(text: str):
+    """True or False for the spellings config.rs accepts, None for anything else."""
+    v = text.lower()
+    if v in ("true", "yes", "on", "1"):
+        return True
+    if v in ("false", "no", "off", "0"):
+        return False
+    return None
+
+
+def normalize_mode(text: str) -> str:
+    """The global display mode the engine uses: preedit or direct, anything else is auto."""
+    v = text.lower()
+    return v if v in ("preedit", "direct") else "auto"
+
+
+TOP_KEYS = (
+    "mode",
+    "input_method",
+    "modern_orthography",
+    "auto_restore_english",
+    "remember_state_per_app",
+    "enable_macro",
+    "custom_words",
+    "free_tone_order",
+    "toggle_shortcut",
+    "simple_telex",
+    "quick_telex",
+    "auto_capitalize",
+)
+
+
+def config_key_value(line: str):
+    """(key, value) of a key = value line, read the way load() reads it. None for other lines."""
+    body = strip_comment(line).strip()
+    if not body or (body.startswith("[") and body.endswith("]")) or "=" not in body:
+        return None
+    k, v = body.split("=", 1)
+    return unquote(k.strip()), unquote(v.strip())
+
+
+def section_name(line: str):
+    """The name of a [section] header line, or None."""
+    body = strip_comment(line).strip()
+    if body.startswith("[") and body.endswith("]"):
+        return body[1:-1].strip()
+    return None
+
+
+def _append_before_trailing_blank(lines, new):
+    """Appends new lines after the content but before any trailing blank lines."""
+    tail = []
+    while lines and not lines[-1].strip():
+        tail.insert(0, lines.pop())
+    lines.extend(new)
+    lines.extend(tail)
+    return lines
+
+
+def _entry_line(key: str, value: str, quote_value: bool) -> str:
+    return f'"{key}" = "{value}"' if quote_value else f'"{key}" = {value}'
+
+
+def merge_entries(body, mapping, quote_value: bool):
+    """Brings one section body in line with mapping. Comments and blank lines stay, an unchanged
+    entry keeps its original line, an entry missing from mapping is dropped, and new entries are
+    added at the end."""
+    out, seen = [], set()
+    for line in body:
+        kv = config_key_value(line)
+        if kv is None:
+            out.append(line)
+            continue
+        k, v = kv
+        if k not in mapping or k in seen:
+            continue
+        seen.add(k)
+        out.append(line if mapping[k] == v else _entry_line(k, mapping[k], quote_value))
+    missing = [
+        _entry_line(k, mapping[k], quote_value) for k in sorted(mapping) if k not in seen
+    ]
+    return _append_before_trailing_blank(out, missing)
+
+
+def render_config(existing: str, top: dict, app_modes: dict, macros: dict) -> str:
+    """The config text after a save. Managed top-level keys are set from top, app_modes and macros
+    are merged as above, and every other line (unknown keys, unknown sections, comments) is kept."""
+    lines = existing.splitlines() if existing.strip() else ["# Rustype configuration"]
+    head, sections = [], []
+    cur = head
+    for line in lines:
+        name = section_name(line)
+        if name is None:
+            cur.append(line)
+        else:
+            cur = []
+            sections.append((name, line, cur))
+
+    out, seen = [], set()
+    for line in head:
+        kv = config_key_value(line)
+        if kv is not None and kv[0].startswith("app_mode."):
+            continue  # the value lives in [app_modes] now
+        if kv is not None and kv[0] in top:
+            k, v = kv
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(line if v == top[k] else f"{k} = {top[k]}")
+        else:
+            out.append(line)
+    out = _append_before_trailing_blank(
+        out, [f"{k} = {top[k]}" for k in TOP_KEYS if k not in seen]
+    )
+
+    managed = {"app_modes": app_modes, "macros": macros}
+    done = set()
+    blocks = []
+    for name, header, body in sections:
+        if name in managed and name not in done:
+            done.add(name)
+            body = merge_entries(body, managed[name], quote_value=(name == "macros"))
+        elif name not in managed:
+            body = [l for l in body if not (config_key_value(l) or ("",))[0].startswith("app_mode.")]
+        blocks.append((header, body))
+    for name in ("app_modes", "macros"):
+        if name not in done:
+            blocks.append(
+                (f"[{name}]", merge_entries([], managed[name], quote_value=(name == "macros")))
+            )
+
+    result = list(out)
+    for header, body in blocks:
+        if result and result[-1].strip():
+            result.append("")
+        result.append(header)
+        result.extend(body)
+    return "\n".join(result) + "\n"
+
+
+def write_config_text(path: pathlib.Path, text: str):
+    """Writes text beside the target and renames it over the target, following a symlink first."""
+    target = path.resolve() if path.exists() else path
+    tmp = target.with_name(f".{target.name}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _bool_text(value: bool) -> str:
+    return "true" if value else "false"
+
+
+class ConfigManager:
+    def __init__(self):
+        self.mode = "auto"
+        self.input_method = "telex"
+        self.modern_orthography = False
+        self.auto_restore_english = True
+        self.remember_state_per_app = True
+        self.enable_macro = False
+        self.free_tone_order = True
+        self.toggle_shortcut = "ctrl_shift"
+        self.simple_telex = False
+        self.quick_telex = False
+        self.auto_capitalize = False
+        self.app_modes = {}
+        self.macros = {}
+        self.custom_words = []
+        self.load()
+
+    def load(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        text = read_text_or_none(CONFIG_FILE) if CONFIG_FILE.exists() else None
+        if text is not None:
+            section = ""
+            for line in text.splitlines():
+                line = strip_comment(line).strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1].strip()
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = unquote(k.strip()), unquote(v.strip())
+                    if section == "app_modes":
+                        self.app_modes[k] = v
+                    elif section == "macros":
+                        self.macros[k] = v
+                    elif k.startswith("app_mode."):
+                        # The engine reads this form too and lowercases the app name (config.rs:333-336).
+                        app = k[len("app_mode."):].strip('"')
+                        self.app_modes[app.lower()] = v
+                    elif k == "mode":
+                        self.mode = normalize_mode(v)
+                    elif k == "input_method":
+                        self.input_method = "vni" if v.lower() == "vni" else "telex"
+                    elif k == "toggle_shortcut":
+                        self.toggle_shortcut = v.lower()
+                    elif k == "custom_words":
+                        self.custom_words = [
+                            w.strip().strip('"') for w in v.split(",") if w.strip()
+                        ]
+                    elif k in BOOL_OPTIONS:
+                        flag = parse_bool(v)
+                        if flag is not None:  # any other value keeps the default, as config.rs does
+                            setattr(self, k, flag)
+
+        if MACRO_FILE.exists():
+            for line in (read_text_or_none(MACRO_FILE) or "").splitlines():
+                line = strip_comment(line).strip()
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    if k.strip() and v.strip():  # config.rs skips an empty key or value
+                        self.macros[k.strip()] = v.strip()
+
+        if WORDS_FILE.exists():
+            for line in (read_text_or_none(WORDS_FILE) or "").splitlines():
+                w = strip_comment(line).strip()
+                if w and w not in self.custom_words:
+                    self.custom_words.append(w)
+
+    def save(self):
+        """Writes the config. Keys and sections this app does not manage are kept as they are."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        dest = CONFIG_FILE
+        if CONFIG_FILE.exists():
+            dest = CONFIG_FILE.resolve()
+            text = read_text_or_none(dest)
+            if text is None:
+                # Not UTF-8: move the bytes aside rather than overwrite them, then write fresh.
+                os.replace(dest, dest.with_name(dest.name + ".invalid"))
+            else:
+                existing = text
+        top = {
+            "mode": self.mode,
+            "input_method": self.input_method,
+            "modern_orthography": _bool_text(self.modern_orthography),
+            "auto_restore_english": _bool_text(self.auto_restore_english),
+            "remember_state_per_app": _bool_text(self.remember_state_per_app),
+            "enable_macro": _bool_text(self.enable_macro),
+            # A word with a comma cannot be stored in this list; it stays in the words file.
+            "custom_words": ", ".join(w for w in self.custom_words if "," not in w),
+            "free_tone_order": _bool_text(self.free_tone_order),
+            "toggle_shortcut": self.toggle_shortcut,
+            "simple_telex": _bool_text(self.simple_telex),
+            "quick_telex": _bool_text(self.quick_telex),
+            "auto_capitalize": _bool_text(self.auto_capitalize),
+        }
+        write_config_text(dest, render_config(existing, top, self.app_modes, self.macros))
+
+
+class RustypeSettingsApp(Adw.Application):
+    def __init__(self):
+        super().__init__(
+            application_id="dev.namtr.RustypeSettings",
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
+        self.cfg = ConfigManager()
+
+    def do_activate(self):
+        win = RustypePreferencesWindow(self, self.cfg)
+        win.present()
+
+
+class RustypePreferencesWindow(Adw.PreferencesWindow):
+    def __init__(self, app, cfg: ConfigManager):
+        super().__init__(application=app, title="Cài đặt Rustype")
+        self.cfg = cfg
+        self.set_default_size(680, 560)
+        self.set_icon_name("dev.namtr.RustypeSettings")
+
+        # ---------------- Trang 1: Cơ bản ----------------
+        page_general = Adw.PreferencesPage(
+            title="Cơ bản", icon_name="preferences-system-symbolic"
+        )
+        self.add(page_general)
+
+        # Nhóm Kiểu gõ
+        grp_method = Adw.PreferencesGroup(title="Kiểu gõ")
+        page_general.add(grp_method)
+
+        method_model = Gtk.StringList.new(["Telex", "VNI"])
+        self.row_method = Adw.ComboRow(title="Kiểu gõ chính", model=method_model)
+        self.row_method.set_selected(0 if cfg.input_method.lower() == "telex" else 1)
+        self.row_method.connect("notify::selected", self.on_method_changed)
+        grp_method.add(self.row_method)
+
+        # Nhóm Cách hiển thị
+        grp_display = Adw.PreferencesGroup(title="Hiển thị chữ (Display Mode)")
+        page_general.add(grp_display)
+
+        mode_model = Gtk.StringList.new(
+            [
+                "Tự động (Auto) - Gạch chân trong terminal, trực tiếp ở ứng dụng thường",
+                "Luôn gạch chân (Preedit) - Ổn định nhất",
+                "Không gạch chân (Direct)",
+            ]
+        )
+        self.row_mode = Adw.ComboRow(title="Chế độ hiển thị", model=mode_model)
+        mode_idx = 0 if cfg.mode == "auto" else (1 if cfg.mode == "preedit" else 2)
+        self.row_mode.set_selected(mode_idx)
+        self.row_mode.connect("notify::selected", self.on_mode_changed)
+        grp_display.add(self.row_mode)
+
+        # Nhóm Tính năng thông minh
+        grp_features = Adw.PreferencesGroup(title="Tính năng thông minh")
+        page_general.add(grp_features)
+
+        self.sw_modern = Adw.SwitchRow(
+            title="Đặt dấu kiểu mới (hoà, khoẻ, thuý)",
+            subtitle="Mặc định tắt: hòa, khỏe, thúy",
+            active=cfg.modern_orthography,
+        )
+        self.sw_modern.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "modern_orthography", self.sw_modern.get_active()
+            ),
+        )
+        grp_features.add(self.sw_modern)
+
+        self.sw_english = Adw.SwitchRow(
+            title="Tự động trả lại từ tiếng Anh",
+            subtitle="Phục hồi window, software, user... khi gõ hết từ",
+            active=cfg.auto_restore_english,
+        )
+        self.sw_english.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "auto_restore_english", self.sw_english.get_active()
+            ),
+        )
+        grp_features.add(self.sw_english)
+
+        self.sw_remember = Adw.SwitchRow(
+            title="Nhớ trạng thái theo từng ứng dụng",
+            subtitle="Giữ trạng thái bật/tắt riêng cho từng cửa sổ như EVKey",
+            active=cfg.remember_state_per_app,
+        )
+        self.sw_remember.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "remember_state_per_app", self.sw_remember.get_active()
+            ),
+        )
+        grp_features.add(self.sw_remember)
+
+        self.sw_free_tone = Adw.SwitchRow(
+            title="Gõ dấu tự do (thfi → thì)",
+            subtitle="Dấu f, j, x gõ trước nguyên âm vẫn có hiệu lực. Mặc định bật",
+            active=cfg.free_tone_order,
+        )
+        self.sw_free_tone.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "free_tone_order", self.sw_free_tone.get_active()
+            ),
+        )
+        grp_features.add(self.sw_free_tone)
+
+        self.sw_toggle = Adw.SwitchRow(
+            title="Phím tắt Ctrl+Shift bật/tắt tiếng Việt",
+            subtitle="Nhấn Ctrl và Shift cùng lúc, rồi nhả một phím",
+            active=cfg.toggle_shortcut != "off",
+        )
+        self.sw_toggle.connect(
+            "notify::active",
+            lambda *_: self.on_toggle_shortcut_changed(self.sw_toggle.get_active()),
+        )
+        grp_features.add(self.sw_toggle)
+
+        self.sw_simple = Adw.SwitchRow(
+            title="Simple Telex",
+            subtitle="w đứng một mình không thành ư",
+            active=cfg.simple_telex,
+        )
+        self.sw_simple.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed("simple_telex", self.sw_simple.get_active()),
+        )
+        grp_features.add(self.sw_simple)
+
+        self.sw_quick = Adw.SwitchRow(
+            title="Quick Telex",
+            subtitle="cc thành ch, gg thành gi, kk thành kh, nn thành ng, pp thành ph, qq thành qu, tt thành th, chỉ ở đầu từ",
+            active=cfg.quick_telex,
+        )
+        self.sw_quick.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed("quick_telex", self.sw_quick.get_active()),
+        )
+        grp_features.add(self.sw_quick)
+
+        self.sw_capitalize = Adw.SwitchRow(
+            title="Tự viết hoa đầu câu",
+            subtitle="Viết hoa chữ đầu sau dấu chấm, chấm hỏi, chấm than và dấu cách; không áp dụng ở ô URL và terminal",
+            active=cfg.auto_capitalize,
+        )
+        self.sw_capitalize.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "auto_capitalize", self.sw_capitalize.get_active()
+            ),
+        )
+        grp_features.add(self.sw_capitalize)
+
+        # ---------------- Trang 2: Gõ tắt (Macro) ----------------
+        page_macro = Adw.PreferencesPage(
+            title="Gõ tắt", icon_name="document-edit-symbolic"
+        )
+        self.add(page_macro)
+
+        grp_macro_cfg = Adw.PreferencesGroup(title="Tính năng gõ tắt")
+        page_macro.add(grp_macro_cfg)
+
+        self.sw_macro = Adw.SwitchRow(
+            title="Bật tính năng gõ tắt (Macro)",
+            subtitle="Tự động mở rộng từ viết tắt khi nhấn dấu cách hoặc dấu câu",
+            active=cfg.enable_macro,
+        )
+        self.sw_macro.connect(
+            "notify::active",
+            lambda *_: self.on_switch_changed(
+                "enable_macro", self.sw_macro.get_active()
+            ),
+        )
+        grp_macro_cfg.add(self.sw_macro)
+
+        self.grp_macro_list = Adw.PreferencesGroup(title="Danh sách từ gõ tắt")
+        page_macro.add(self.grp_macro_list)
+
+        btn_add_macro = Gtk.Button(
+            label="Thêm từ gõ tắt", icon_name="list-add-symbolic"
+        )
+        btn_add_macro.connect("clicked", self.on_add_macro_clicked)
+        self.grp_macro_list.set_header_suffix(btn_add_macro)
+        self.macro_rows = []
+        self.refresh_macros()
+
+        # ---------------- Trang 3: Từ điển tiếng Anh ----------------
+        page_words = Adw.PreferencesPage(
+            title="Từ điển riêng", icon_name="format-text-strikethrough-symbolic"
+        )
+        self.add(page_words)
+
+        self.grp_words = Adw.PreferencesGroup(
+            title="Từ tiếng Anh ngoại lệ",
+            description="Các từ này sẽ không bao giờ bị thêm dấu nhầm (ví dụ: this không thành thí, test không thành tét).",
+        )
+        page_words.add(self.grp_words)
+
+        btn_add_word = Gtk.Button(label="Thêm từ", icon_name="list-add-symbolic")
+        btn_add_word.connect("clicked", self.on_add_word_clicked)
+        self.grp_words.set_header_suffix(btn_add_word)
+        self.word_rows = []
+        self.refresh_words()
+
+        # ---------------- Trang: Ứng dụng luôn tắt ----------------
+        page_off = Adw.PreferencesPage(
+            title="Ứng dụng luôn tắt", icon_name="window-close-symbolic"
+        )
+        self.add(page_off)
+
+        self.grp_off = Adw.PreferencesGroup(
+            title="Ứng dụng không gõ tiếng Việt",
+            description="Nhập mã ứng dụng, ví dụ org.gnome.Terminal. Tính năng này cần tiện ích GNOME Shell của Rustype.",
+        )
+        page_off.add(self.grp_off)
+
+        btn_add_off = Gtk.Button(label="Thêm ứng dụng", icon_name="list-add-symbolic")
+        btn_add_off.connect("clicked", self.on_add_off_clicked)
+        self.grp_off.set_header_suffix(btn_add_off)
+        self.off_rows = []
+        self.refresh_off_apps()
+
+        # ---------------- Trang 4: Giới thiệu & Chẩn đoán ----------------
+        self.version = get_installed_version()
+
+        page_about = Adw.PreferencesPage(
+            title="Giới thiệu", icon_name="help-about-symbolic"
+        )
+        self.add(page_about)
+
+        # Nhóm Thông tin phần mềm
+        grp_about = Adw.PreferencesGroup(
+            title="Rustype",
+            description="Bộ gõ tiếng Việt siêu nhẹ cho Linux • Viết bằng Pure Rust",
+        )
+        page_about.add(grp_about)
+
+        # Dòng Phiên bản & Kiểm tra cập nhật
+        self.row_version = Adw.ActionRow(
+            title="Phiên bản",
+            subtitle=f"v{self.version}",
+        )
+        self.btn_check_update = Gtk.Button(
+            label="Kiểm tra cập nhật",
+            icon_name="view-refresh-symbolic",
+            valign=Gtk.Align.CENTER,
+        )
+        self.btn_check_update.connect("clicked", self.on_check_update_clicked)
+        self.row_version.add_suffix(self.btn_check_update)
+        grp_about.add(self.row_version)
+
+        # Dòng Tác giả & Website namtr.dev
+        row_author = Adw.ActionRow(
+            title="Tác giả",
+            subtitle="Nam Tran • namtr.dev",
+        )
+        btn_website = Gtk.Button(
+            icon_name="adw-external-link-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Mở trang web tác giả: https://namtr.dev",
+            css_classes=["flat"],
+        )
+        btn_website.connect(
+            "clicked",
+            lambda *_: Gio.AppInfo.launch_default_for_uri("https://namtr.dev", None),
+        )
+        row_author.add_suffix(btn_website)
+        grp_about.add(row_author)
+
+        # Dòng Hỗ trợ kỹ thuật
+        row_support = Adw.ActionRow(
+            title="Hỗ trợ & Liên hệ",
+            subtitle="support@namtr.dev",
+            use_markup=False,
+        )
+        btn_mail = Gtk.Button(
+            icon_name="mail-send-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Gửi email hỗ trợ: support@namtr.dev",
+            css_classes=["flat"],
+        )
+        btn_mail.connect(
+            "clicked",
+            lambda *_: Gio.AppInfo.launch_default_for_uri(
+                "mailto:support@namtr.dev", None
+            ),
+        )
+        row_support.add_suffix(btn_mail)
+        grp_about.add(row_support)
+
+        # Dòng Mã nguồn GitHub
+        row_github = Adw.ActionRow(
+            title="Mã nguồn GitHub",
+            subtitle="https://github.com/tr-nam/rustype",
+        )
+        btn_github = Gtk.Button(
+            icon_name="adw-external-link-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Mở kho mã nguồn",
+            css_classes=["flat"],
+        )
+        btn_github.connect(
+            "clicked",
+            lambda *_: Gio.AppInfo.launch_default_for_uri(
+                "https://github.com/tr-nam/rustype", None
+            ),
+        )
+        row_github.add_suffix(btn_github)
+        grp_about.add(row_github)
+
+        # Dòng Giấy phép
+        row_license = Adw.ActionRow(
+            title="Giấy phép",
+            subtitle="MIT License • 100% Mã nguồn mở, an toàn và bảo mật",
+        )
+        grp_about.add(row_license)
+
+        # Nhóm Chẩn đoán hệ thống (Thiết kế lại hoàn toàn)
+        grp_diag = Adw.PreferencesGroup(
+            title="Chẩn đoán hệ thống",
+            description="Kiểm tra rustype-linux, drop-in systemd của IBus trên GNOME và extension GNOME Shell.",
+        )
+        page_about.add(grp_diag)
+
+        # 1. Hàng thực thi kiểm tra chẩn đoán
+        self.row_doctor = Adw.ActionRow(
+            title="Tình trạng hoạt động hệ thống",
+            subtitle="Nhấn nút bên phải để bắt đầu quét và chẩn đoán toàn diện",
+        )
+        self.img_doctor_status = Gtk.Image(
+            icon_name="dialog-information-symbolic",
+            pixel_size=20,
+        )
+        self.row_doctor.add_prefix(self.img_doctor_status)
+
+        self.spinner_doctor = Gtk.Spinner(spinning=False, visible=False)
+        self.row_doctor.add_suffix(self.spinner_doctor)
+
+        self.btn_run_doctor = Gtk.Button(
+            label="Chạy chẩn đoán",
+            icon_name="system-run-symbolic",
+            css_classes=["suggested-action"],
+            valign=Gtk.Align.CENTER,
+        )
+        self.btn_run_doctor.connect("clicked", self.on_run_doctor_clicked)
+        self.row_doctor.add_suffix(self.btn_run_doctor)
+        grp_diag.add(self.row_doctor)
+
+        # 2. Hàng mở rộng xem chi tiết nhật ký
+        self.expander_log = Adw.ExpanderRow(
+            title="Chi tiết nhật ký chẩn đoán",
+            subtitle="Nhấn để xem hoặc sao chép kết quả quét",
+        )
+        self.expander_log.add_prefix(
+            Gtk.Image(icon_name="utilities-terminal-symbolic", pixel_size=18)
+        )
+
+        btn_copy_log = Gtk.Button(
+            icon_name="edit-copy-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Sao chép toàn bộ nhật ký",
+            css_classes=["flat"],
+        )
+        btn_copy_log.connect("clicked", self.on_copy_doctor_log_clicked)
+        self.expander_log.add_action(btn_copy_log)
+
+        self.tv_doctor = Gtk.TextView(
+            editable=False,
+            monospace=True,
+            wrap_mode=Gtk.WrapMode.WORD,
+            left_margin=12,
+            right_margin=12,
+            top_margin=10,
+            bottom_margin=10,
+        )
+        self.tv_doctor.get_buffer().set_text(
+            'Nhấn "Chạy chẩn đoán" để kiểm tra rustype-linux, cấu hình và tiện ích mở rộng.'
+        )
+
+        scrolled = Gtk.ScrolledWindow(
+            child=self.tv_doctor,
+            min_content_height=200,
+            max_content_height=320,
+            css_classes=["card"],
+        )
+        self.expander_log.add_row(Adw.PreferencesRow(child=scrolled))
+        grp_diag.add(self.expander_log)
+
+    def notify(self, message: str, button_label: str = None, callback=None):
+        """Displays a clean in-app toast notification."""
+        toast = Adw.Toast.new(message)
+        if button_label and callback:
+            toast.set_button_label(button_label)
+            toast.connect("button-clicked", callback)
+        self.add_toast(toast)
+
+    def on_method_changed(self, combo, _):
+        self.cfg.input_method = "telex" if combo.get_selected() == 0 else "vni"
+        self.cfg.save()
+
+    def on_mode_changed(self, combo, _):
+        idx = combo.get_selected()
+        self.cfg.mode = "auto" if idx == 0 else ("preedit" if idx == 1 else "direct")
+        self.cfg.save()
+
+    def on_switch_changed(self, key, value):
+        setattr(self.cfg, key, value)
+        self.cfg.save()
+
+    def on_toggle_shortcut_changed(self, active):
+        self.cfg.toggle_shortcut = "ctrl_shift" if active else "off"
+        self.cfg.save()
+
+    def refresh_off_apps(self):
+        for row in self.off_rows:
+            self.grp_off.remove(row)
+        self.off_rows = []
+        for app in sorted(k for k, v in self.cfg.app_modes.items() if v.lower() == "off"):
+            row = Adw.ActionRow(title=app, use_markup=False)
+            btn_del = Gtk.Button(
+                icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER
+            )
+            btn_del.connect("clicked", lambda _, a=app: self.delete_off_app(a))
+            row.add_suffix(btn_del)
+            self.grp_off.add(row)
+            self.off_rows.append(row)
+
+    def delete_off_app(self, app):
+        # Only an entry whose mode is off is removed; other modes in [app_modes] stay.
+        if self.cfg.app_modes.get(app, "").lower() == "off":
+            del self.cfg.app_modes[app]
+            self.cfg.save()
+            self.refresh_off_apps()
+            self.notify(f"Đã xóa: {app}")
+
+    def on_add_off_clicked(self, _):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Thêm ứng dụng luôn tắt",
+            body="Rustype sẽ không gõ tiếng Việt trong ứng dụng này.",
+        )
+        entry = Gtk.Entry(placeholder_text="Mã ứng dụng (vd: org.gnome.Terminal)")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Hủy")
+        dialog.add_response("add", "Thêm")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_resp(d, resp):
+            if resp != "add":
+                return
+            app = entry.get_text().strip().lower()
+            if not app:
+                return
+            if any(c in app for c in '"#=[] \t'):
+                self.notify("Mã ứng dụng không hợp lệ")
+                return
+            # The engine lowercases app ids, so a key that differs only in case is the same app.
+            existing = next((k for k in self.cfg.app_modes if k.lower() == app), None)
+            if existing is not None:
+                current = self.cfg.app_modes[existing]
+                if current.lower() != "off":
+                    self.notify(f"{app} đã có chế độ {current}, sửa trong tệp cấu hình")
+                else:
+                    self.notify("Ứng dụng này đã có trong danh sách")
+                return
+            self.cfg.app_modes[app] = "off"
+            self.cfg.save()
+            self.refresh_off_apps()
+            self.notify(f"Đã thêm: {app}")
+
+        dialog.connect("response", on_resp)
+        dialog.present()
+
+    def refresh_macros(self):
+        for row in self.macro_rows:
+            self.grp_macro_list.remove(row)
+        self.macro_rows = []
+        for k, v in sorted(self.cfg.macros.items()):
+            row = Adw.ActionRow(title=k, subtitle=v, use_markup=False)
+            btn_del = Gtk.Button(
+                icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER
+            )
+            btn_del.connect("clicked", lambda _, key=k: self.delete_macro(key))
+            row.add_suffix(btn_del)
+            self.grp_macro_list.add(row)
+            self.macro_rows.append(row)
+
+    def delete_macro(self, key):
+        self.cfg.macros.pop(key, None)
+        self.cfg.save()
+        err = rewrite_file(MACRO_FILE, lambda t: drop_macro_lines(t, key))
+        self.refresh_macros()
+        if err:
+            self.notify(f"Không thể cập nhật tệp macro: {err}")
+        else:
+            self.notify("Đã xóa từ gõ tắt")
+
+    def on_add_macro_clicked(self, _):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Thêm từ gõ tắt",
+            body="Nhập từ viết tắt và nội dung mở rộng tương ứng.",
+        )
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        e_key = Gtk.Entry(placeholder_text="Từ viết tắt (vd: vn)")
+        e_val = Gtk.Entry(placeholder_text="Nội dung đầy đủ (vd: Việt Nam)")
+        box.append(e_key)
+        box.append(e_val)
+        dialog.set_extra_child(box)
+
+        dialog.add_response("cancel", "Hủy")
+        dialog.add_response("add", "Thêm")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_resp(d, resp):
+            if resp == "add":
+                k, v = e_key.get_text().strip(), e_val.get_text().strip()
+                if k and v:
+                    if '"' in v and "#" in v:
+                        # The comment stripper cannot read a value that holds both characters.
+                        self.notify('Nội dung không được chứa cả dấu " và dấu #')
+                        return
+                    self.cfg.macros[k] = v
+                    self.cfg.save()
+                    # A line with the same key in the macro file would win on load, so remove it.
+                    err = rewrite_file(MACRO_FILE, lambda t: drop_macro_lines(t, k))
+                    self.refresh_macros()
+                    if err:
+                        self.notify(f"Không thể cập nhật tệp macro: {err}")
+                    else:
+                        self.notify(f"Đã thêm: {k} ➔ {v}")
+
+        dialog.connect("response", on_resp)
+        dialog.present()
+
+    def refresh_words(self):
+        for row in self.word_rows:
+            self.grp_words.remove(row)
+        self.word_rows = []
+        for w in self.cfg.custom_words:
+            row = Adw.ActionRow(title=w, use_markup=False)
+            btn_del = Gtk.Button(
+                icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER
+            )
+            btn_del.connect("clicked", lambda _, word=w: self.delete_word(word))
+            row.add_suffix(btn_del)
+            self.grp_words.add(row)
+            self.word_rows.append(row)
+
+    def delete_word(self, word):
+        if word in self.cfg.custom_words:
+            self.cfg.custom_words.remove(word)
+            self.cfg.save()
+            err = rewrite_file(WORDS_FILE, lambda t: drop_word_lines(t, word))
+            self.refresh_words()
+            if err:
+                self.notify(f"Không thể cập nhật tệp từ: {err}")
+            else:
+                self.notify(f"Đã xóa từ: {word}")
+
+    def on_add_word_clicked(self, _):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Thêm từ tiếng Anh ngoại lệ",
+            body="Từ này sẽ được giữ nguyên không bao giờ bỏ dấu tiếng Việt.",
+        )
+        entry = Gtk.Entry(placeholder_text="Từ tiếng Anh (vd: github)")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Hủy")
+        dialog.add_response("add", "Thêm")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_resp(d, resp):
+            if resp == "add":
+                w = entry.get_text().strip().lower()
+                if "," in w:
+                    # The custom_words line is comma separated, so a comma cannot be stored.
+                    self.notify("Từ không được chứa dấu phẩy, hãy thêm từng từ riêng")
+                    return
+                if w and w not in self.cfg.custom_words:
+                    self.cfg.custom_words.append(w)
+                    self.cfg.save()
+                    self.refresh_words()
+                    self.notify(f"Đã thêm từ: {w}")
+
+        dialog.connect("response", on_resp)
+        dialog.present()
+
+    def on_check_update_clicked(self, _):
+        self.btn_check_update.set_sensitive(False)
+        self.row_version.set_subtitle(
+            f"v{self.version} • Đang kiểm tra bản cập nhật..."
+        )
+
+        def worker():
+            try:
+                url = "https://api.github.com/repos/tr-nam/rustype/releases/latest"
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": f"RustypeSettings/{self.version}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        tag = data.get("tag_name", "").lstrip("v").strip()
+                        html_url = data.get(
+                            "html_url", "https://github.com/tr-nam/rustype/releases"
+                        )
+                        GLib.idle_add(self._on_update_result, True, tag, html_url)
+                        return
+                GLib.idle_add(self._on_update_result, False, "HTTP error", "")
+            except Exception as e:
+                GLib.idle_add(self._on_update_result, False, str(e), "")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_result(self, success, tag_or_err, html_url):
+        self.btn_check_update.set_sensitive(True)
+        if not success:
+            self.row_version.set_subtitle(
+                f"v{self.version} • Không thể kiểm tra (Lỗi kết nối mạng)"
+            )
+            self.notify("Không thể kết nối đến máy chủ kiểm tra cập nhật.")
+            return
+
+        latest_tag = tag_or_err
+
+        def parse_ver(v_str):
+            try:
+                clean = v_str.split("-")[0].split("+")[0]
+                return tuple(int(x) for x in clean.split("."))
+            except Exception:
+                return (0, 0, 0)
+
+        cur_v = parse_ver(self.version)
+        lat_v = parse_ver(latest_tag)
+
+        if lat_v > cur_v:
+            self.row_version.set_subtitle(
+                f"v{self.version} • Có bản mới: v{latest_tag}!"
+            )
+            self.notify(
+                f"Đã có phiên bản mới: v{latest_tag}!",
+                button_label="Tải về",
+                callback=lambda *_: Gio.AppInfo.launch_default_for_uri(html_url, None),
+            )
+        else:
+            self.row_version.set_subtitle(
+                f"v{self.version} • Bạn đang sử dụng phiên bản mới nhất"
+            )
+            self.notify("Bạn đang sử dụng phiên bản mới nhất!")
+
+    def on_copy_doctor_log_clicked(self, _):
+        buffer = self.tv_doctor.get_buffer()
+        start, end = buffer.get_bounds()
+        text = buffer.get_text(start, end, True)
+        if text.strip():
+            display = Gdk.Display.get_default()
+            if display:
+                display.get_clipboard().set(text)
+            self.notify("Đã sao chép báo cáo chẩn đoán vào bộ nhớ tạm")
+
+    def on_run_doctor_clicked(self, _):
+        self.btn_run_doctor.set_sensitive(False)
+        self.spinner_doctor.set_visible(True)
+        self.spinner_doctor.start()
+        self.row_doctor.set_subtitle("Đang quét toàn diện các thành phần hệ thống...")
+        self.img_doctor_status.set_from_icon_name("process-working-symbolic")
+
+        def worker():
+            out = ""
+            try:
+                exe = find_engine() or ENGINE_NAME
+                res = subprocess.run(
+                    [str(exe), "--doctor"], capture_output=True, text=True, timeout=8
+                )
+                out = res.stdout or res.stderr or "Không có phản hồi từ lệnh chẩn đoán."
+            except Exception as e:
+                out = f"Không thể chạy lệnh chẩn đoán: {e}"
+
+            def update_ui():
+                self.tv_doctor.get_buffer().set_text(out)
+                self.spinner_doctor.stop()
+                self.spinner_doctor.set_visible(False)
+                self.btn_run_doctor.set_sensitive(True)
+                self.expander_log.set_expanded(True)
+
+                if "[✗]" in out:
+                    self.row_doctor.set_subtitle(
+                        "Phát hiện lỗi cần khắc phục (Xem chi tiết bên dưới)"
+                    )
+                    self.img_doctor_status.set_from_icon_name(
+                        "dialog-error-symbolic"
+                    )
+                elif "[!]" in out:
+                    self.row_doctor.set_subtitle(
+                        "Bộ gõ hoạt động tốt (Có một vài cảnh báo cần lưu ý)"
+                    )
+                    self.img_doctor_status.set_from_icon_name(
+                        "dialog-warning-symbolic"
+                    )
+                else:
+                    self.row_doctor.set_subtitle(
+                        "Tất cả thành phần hệ thống đang hoạt động hoàn hảo"
+                    )
+                    self.img_doctor_status.set_from_icon_name(
+                        "emblem-ok-symbolic"
+                    )
+
+                self.notify("Đã hoàn thành chẩn đoán hệ thống")
+
+            GLib.idle_add(update_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+def main():
+    app = RustypeSettingsApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

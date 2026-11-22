@@ -1,0 +1,695 @@
+//! `~/.config/rustkey/config`: a few `key = value` lines, reloaded when the file changes.
+
+use rustkey_core::telex;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// No underline where the app supports Surrounding Text, underline (preedit) elsewhere.
+    Auto,
+    /// Always underline (preedit). Safest everywhere.
+    Preedit,
+    /// No underline where the app supports Surrounding Text; elsewhere it behaves like Preedit.
+    Direct,
+    /// Vietnamese is always off in this app, whatever was remembered for it. Only `[app_modes]`
+    /// can say this.
+    Off,
+}
+
+/// The key chord that turns Vietnamese on and off inside the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToggleShortcut {
+    /// Press Ctrl and Shift together, then let go of one of them.
+    CtrlShift,
+    /// No shortcut: the panel menu is the only switch.
+    Off,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub(crate) mode: Mode,
+    pub(crate) telex: telex::Config,
+    pub(crate) app_modes: HashMap<String, Mode>,
+    pub(crate) remember_state_per_app: bool,
+    pub(crate) toggle_shortcut: ToggleShortcut,
+    pub(crate) auto_capitalize: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            mode: Mode::Auto,
+            telex: telex::Config::default(),
+            app_modes: HashMap::new(),
+            remember_state_per_app: true,
+            toggle_shortcut: ToggleShortcut::CtrlShift,
+            auto_capitalize: false,
+        }
+    }
+}
+
+impl Config {
+    /// Gets the display mode for a specific application, or the global default.
+    pub(crate) fn mode_for_app(&self, app_id: Option<&str>) -> Mode {
+        if let Some(id) = app_id {
+            if let Some(m) = self.app_modes.get(id) {
+                return *m;
+            }
+            if let Some(base) = id.strip_suffix(".desktop") {
+                if let Some(m) = self.app_modes.get(base) {
+                    return *m;
+                }
+            }
+            let lower = id.to_lowercase();
+            if let Some(m) = self.app_modes.get(&lower) {
+                return *m;
+            }
+            if let Some(base) = lower.strip_suffix(".desktop") {
+                if let Some(m) = self.app_modes.get(base) {
+                    return *m;
+                }
+            }
+        }
+        self.mode
+    }
+}
+
+pub(crate) const DEFAULT_FILE: &str = "\
+# Rustkey: bộ gõ tiếng Việt Telex.
+# Sửa xong thì bấm sang ô gõ khác là có hiệu lực, không cần khởi động lại.
+
+# auto    : không gạch chân ở ứng dụng thường, gạch chân trong terminal (khuyên dùng)
+# preedit : luôn gạch chân
+# direct  : giống auto, giữ lại để không hỏng cấu hình cũ
+mode = auto
+
+# false: hòa, khỏe, thúy   true: hoà, khoẻ, thuý
+modern_orthography = false
+
+# Tự trả lại từ tiếng Anh khi gõ window, software, user...
+auto_restore_english = true
+
+# Telex: phím dấu f, j, x gõ trước nguyên âm vẫn được nhận: thfi ra thì
+free_tone_order = true
+
+# Kiểu gõ: telex | vni
+input_method = telex
+
+# Telex đơn giản: 'w' đứng riêng là chữ w, không thành 'ư' (true: bật)
+simple_telex = false
+
+# Telex nhanh: gõ đôi phụ âm đầu thành âm ghép: cc=ch, gg=gi, kk=kh, nn=ng, pp=ph, qq=qu, tt=th
+quick_telex = false
+
+# Tự viết hoa chữ cái đầu câu, sau . ! ? và một khoảng trắng (không áp dụng cho ô URL, mật khẩu)
+auto_capitalize = false
+
+# Bật gõ tắt (macro) từ file ~/.config/rustkey/macro hoặc mục [macros]
+enable_macro = false
+
+# Nhớ trạng thái bật/tắt tiếng Việt theo từng ứng dụng (như EVKey)
+remember_state_per_app = true
+
+# Phím tắt bật/tắt tiếng Việt: ctrl_shift (nhấn Ctrl và Shift cùng lúc, rồi nhả một phím) | off
+toggle_shortcut = ctrl_shift
+
+# Từ tiếng Anh bổ sung (không bị bỏ dấu nhầm):
+# custom_words = this, test, github, cargo, rust
+
+# Cấu hình chế độ riêng cho từng ứng dụng (tuỳ chọn):
+# [app_modes]
+# \"org.gnome.Ptyxis\" = preedit
+# \"org.gnome.Terminal\" = off   (tắt hẳn tiếng Việt trong ứng dụng này)
+# \"kitty\" = preedit
+# \"google-chrome\" = auto
+
+# Bảng gõ tắt (hoặc đặt trong ~/.config/rustkey/macro):
+# [macros]
+# vn = \"Việt Nam\"
+# hn = \"Hà Nội\"
+";
+
+pub(crate) fn path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rustkey").join("config"))
+}
+
+/// Writes the sample configuration to `p` unless a file is already there. Returns whether it was
+/// written; an existing file is never touched.
+pub(crate) fn create_default(p: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Write;
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(p)
+    {
+        Ok(mut f) => {
+            f.write_all(DEFAULT_FILE.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// True for a line whose key is exactly `input_method`: `input_method = x` or `input_method=x`.
+fn is_input_method_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("input_method")
+        .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with('='))
+}
+
+/// Updates `input_method = telex` or `vni` in `~/.config/rustkey/config`.
+pub(crate) fn update_input_method(method: rustkey_core::telex::InputMethod) {
+    if let Some(p) = path() {
+        update_input_method_at(&p, method);
+    }
+}
+
+fn update_input_method_at(p: &std::path::Path, method: rustkey_core::telex::InputMethod) {
+    let method_str = match method {
+        rustkey_core::telex::InputMethod::Telex => "telex",
+        rustkey_core::telex::InputMethod::Vni => "vni",
+    };
+    // Follow a symlinked config so the link survives the rename below.
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let Ok(content) = std::fs::read_to_string(&p) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let mut replaced = false;
+    for line in content.lines() {
+        if is_input_method_line(line) {
+            lines.push(format!("input_method = {method_str}"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(format!("input_method = {method_str}"));
+    }
+    // Write a sibling temp file, then rename over the config: readers never see a half-written file.
+    let Some(name) = p.file_name() else { return };
+    let tmp = p.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    let body = lines.join("\n") + "\n";
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Cuts a line at the first `#` that is outside double quotes.
+fn strip_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (idx, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Strips one pair of surrounding double quotes. Any other text is returned unchanged.
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_mode(v: &str) -> Mode {
+    match v.to_ascii_lowercase().as_str() {
+        "preedit" => Mode::Preedit,
+        "direct" => Mode::Direct,
+        "off" => Mode::Off,
+        _ => Mode::Auto,
+    }
+}
+
+pub(crate) fn parse(text: &str) -> Config {
+    let mut cfg = Config::default();
+    let mut section = "";
+    for line in text.lines() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (unquote(k.trim()), unquote(v.trim()));
+        if section == "app_modes" {
+            // Lookups in mode_for_app are lowercase, so store the key that way.
+            cfg.app_modes.insert(k.to_lowercase(), parse_mode(v));
+            continue;
+        }
+        if section == "macros" {
+            cfg.telex.macros.insert(k.to_string(), v.to_string());
+            continue;
+        }
+        match k {
+            // Off is per app: a global `mode = off` would switch Vietnamese off everywhere.
+            "mode" => {
+                cfg.mode = match parse_mode(v) {
+                    Mode::Off => Mode::Auto,
+                    m => m,
+                }
+            }
+            "input_method" => {
+                cfg.telex.input_method = match v.to_ascii_lowercase().as_str() {
+                    "vni" => telex::InputMethod::Vni,
+                    _ => telex::InputMethod::Telex,
+                };
+            }
+            "modern_orthography" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.modern_orthography = b;
+                }
+            }
+            "auto_restore_english" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.auto_restore_english = b;
+                }
+            }
+            "free_tone_order" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.free_tone_order = b;
+                }
+            }
+            "remember_state_per_app" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.remember_state_per_app = b;
+                }
+            }
+            "toggle_shortcut" => {
+                cfg.toggle_shortcut = match v.to_ascii_lowercase().as_str() {
+                    "off" => ToggleShortcut::Off,
+                    _ => ToggleShortcut::CtrlShift,
+                };
+            }
+            "simple_telex" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.simple_telex = b;
+                }
+            }
+            "quick_telex" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.quick_telex = b;
+                }
+            }
+            "auto_capitalize" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.auto_capitalize = b;
+                }
+            }
+            "enable_macro" => {
+                if let Some(b) = parse_bool(v) {
+                    cfg.telex.enable_macro = b;
+                }
+            }
+            "custom_words" => {
+                for word in v.split(',') {
+                    let w = word.trim().trim_matches('"');
+                    if !w.is_empty() {
+                        cfg.telex.custom_words.push(w.to_string());
+                    }
+                }
+            }
+            other if other.starts_with("app_mode.") => {
+                let app = other.strip_prefix("app_mode.").unwrap().trim_matches('"');
+                cfg.app_modes.insert(app.to_lowercase(), parse_mode(v));
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(crate) fn load_extra_files(cfg: &mut Config) {
+    if let Some(dir) = path().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        load_extra_files_from(cfg, &dir);
+    }
+}
+
+fn load_extra_files_from(cfg: &mut Config, dir: &std::path::Path) {
+    let macro_file = dir.join("macro");
+    if let Ok(content) = std::fs::read_to_string(macro_file) {
+        for line in content.lines() {
+            let line = strip_comment(line).trim();
+            if let Some((k, v)) = line.split_once(':') {
+                let (k, v) = (k.trim(), v.trim());
+                if !k.is_empty() && !v.is_empty() {
+                    cfg.telex.macros.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    let words_file = dir.join("words");
+    if let Ok(content) = std::fs::read_to_string(words_file) {
+        for line in content.lines() {
+            let word = strip_comment(line).trim();
+            if !word.is_empty() {
+                cfg.telex.custom_words.push(word.to_string());
+            }
+        }
+    }
+}
+
+/// Holds the current config and re-reads it when the config, `macro` or `words` mtime changes.
+pub(crate) struct Watcher {
+    /// Files whose mtimes are checked: config, then macro and words beside it.
+    watched: Vec<PathBuf>,
+    dir: Option<PathBuf>,
+    stamps: Option<Vec<Option<SystemTime>>>,
+    pub(crate) current: Config,
+}
+
+impl Default for Watcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Watcher {
+    pub(crate) fn new() -> Self {
+        Self::at(path())
+    }
+
+    fn at(config_path: Option<PathBuf>) -> Self {
+        let dir = config_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let watched = match (&config_path, &dir) {
+            (Some(p), Some(d)) => vec![p.clone(), d.join("macro"), d.join("words")],
+            _ => Vec::new(),
+        };
+        let mut w = Watcher {
+            watched,
+            dir,
+            stamps: None,
+            current: Config::default(),
+        };
+        w.refresh();
+        w
+    }
+
+    /// A watcher that never reads a file and holds `current`. For tests that must not depend on the
+    /// user's config.
+    #[cfg(test)]
+    pub(crate) fn fixed(current: Config) -> Self {
+        Watcher {
+            watched: Vec::new(),
+            dir: None,
+            stamps: None,
+            current,
+        }
+    }
+
+    /// Returns true when the config changed.
+    pub(crate) fn refresh(&mut self) -> bool {
+        if self.watched.is_empty() {
+            return false;
+        }
+        let now: Vec<Option<SystemTime>> = self
+            .watched
+            .iter()
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect();
+        if self.stamps.as_ref() == Some(&now) {
+            return false;
+        }
+        self.stamps = Some(now);
+        let mut cfg = match std::fs::read_to_string(&self.watched[0]) {
+            Ok(text) => parse(&text),
+            Err(_) => Config::default(),
+        };
+        if let Some(dir) = &self.dir {
+            load_extra_files_from(&mut cfg, dir);
+        }
+        self.current = cfg;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_file_parses_to_defaults() {
+        let c = parse(DEFAULT_FILE);
+        assert_eq!(c.mode, Mode::Auto);
+        assert!(!c.telex.modern_orthography);
+        assert!(c.telex.auto_restore_english);
+        assert_eq!(c.toggle_shortcut, ToggleShortcut::CtrlShift);
+    }
+
+    #[test]
+    fn toggle_shortcut_is_case_insensitive_and_falls_back() {
+        assert_eq!(
+            parse("toggle_shortcut = OFF").toggle_shortcut,
+            ToggleShortcut::Off
+        );
+        assert_eq!(
+            parse("toggle_shortcut = Off").toggle_shortcut,
+            ToggleShortcut::Off
+        );
+        assert_eq!(
+            parse("toggle_shortcut = Ctrl_Shift").toggle_shortcut,
+            ToggleShortcut::CtrlShift
+        );
+        assert_eq!(
+            parse("toggle_shortcut = bogus").toggle_shortcut,
+            ToggleShortcut::CtrlShift
+        );
+    }
+
+    #[test]
+    fn parses_values() {
+        let c =
+            parse("mode = preedit\nmodern_orthography = true # kiểu mới\nauto_restore_english=off");
+        assert_eq!(c.mode, Mode::Preedit);
+        assert!(c.telex.modern_orthography);
+        assert!(!c.telex.auto_restore_english);
+        assert!(c.telex.free_tone_order);
+        assert!(!parse("free_tone_order = off").telex.free_tone_order);
+    }
+
+    #[test]
+    fn parses_app_modes() {
+        let text = "\
+mode = auto
+app_mode.kitty = preedit
+
+[app_modes]
+org.gnome.Ptyxis = preedit
+\"google-chrome\" = auto
+";
+        let c = parse(text);
+        assert_eq!(c.mode, Mode::Auto);
+        assert_eq!(c.mode_for_app(Some("org.gnome.Ptyxis")), Mode::Preedit);
+        assert_eq!(c.mode_for_app(Some("kitty")), Mode::Preedit);
+        assert_eq!(c.mode_for_app(Some("google-chrome")), Mode::Auto);
+        assert_eq!(c.mode_for_app(Some("google-chrome.desktop")), Mode::Auto);
+        assert_eq!(
+            c.mode_for_app(Some("org.gnome.Ptyxis.desktop")),
+            Mode::Preedit
+        );
+        assert_eq!(c.mode_for_app(Some("unknown")), Mode::Auto);
+        assert_eq!(c.mode_for_app(None), Mode::Auto);
+    }
+
+    /// Empty directory for a test's files, inside the cargo target dir (not /tmp).
+    fn test_dir(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join("rustkey-test-tmp").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn app_mode_keys_match_regardless_of_case() {
+        let c = parse("app_mode.Kitty = direct\n[app_modes]\n\"Google-Chrome\" = preedit\n");
+        assert_eq!(c.mode_for_app(Some("google-chrome")), Mode::Preedit);
+        assert_eq!(c.mode_for_app(Some("Google-Chrome")), Mode::Preedit);
+        assert_eq!(c.mode_for_app(Some("google-chrome.desktop")), Mode::Preedit);
+        assert_eq!(c.mode_for_app(Some("kitty")), Mode::Direct);
+    }
+
+    #[test]
+    fn hash_inside_quotes_is_not_a_comment() {
+        let c = parse("[macros]\nvn = \"Việt #1\" # trailing comment\n");
+        assert_eq!(
+            c.telex.macros.get("vn").map(|s| s.as_str()),
+            Some("Việt #1")
+        );
+        let c = parse("mode = preedit # chú thích\n");
+        assert_eq!(c.mode, Mode::Preedit);
+    }
+
+    #[test]
+    fn watcher_picks_up_macro_and_words_edits() {
+        let dir = test_dir("watcher");
+        let cfg = dir.join("config");
+        std::fs::write(&cfg, "mode = auto\n").unwrap();
+        let mut w = Watcher::at(Some(cfg.clone()));
+        assert!(w.current.telex.macros.is_empty());
+        assert!(!w.refresh());
+
+        // Creating the macro file is a change.
+        let macro_file = dir.join("macro");
+        std::fs::write(&macro_file, "vn: Việt Nam\n").unwrap();
+        assert!(w.refresh());
+        assert_eq!(
+            w.current.telex.macros.get("vn").map(|s| s.as_str()),
+            Some("Việt Nam")
+        );
+
+        // Editing it in place (mtime moved forward) is a change too.
+        std::fs::write(&macro_file, "vn: Việt Nam Mới\n").unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&macro_file)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(w.refresh());
+        assert_eq!(
+            w.current.telex.macros.get("vn").map(|s| s.as_str()),
+            Some("Việt Nam Mới")
+        );
+        assert!(!w.refresh());
+
+        // The words file works the same way.
+        std::fs::write(dir.join("words"), "github\n").unwrap();
+        assert!(w.refresh());
+        assert!(w.current.telex.custom_words.iter().any(|x| x == "github"));
+    }
+
+    #[test]
+    fn input_method_line_matches_key_exactly() {
+        assert!(is_input_method_line("input_method = telex"));
+        assert!(is_input_method_line("  input_method=vni"));
+        assert!(is_input_method_line("input_method\t= vni"));
+        assert!(!is_input_method_line("input_method_extra = x"));
+        assert!(!is_input_method_line("# input_method = telex"));
+    }
+
+    #[test]
+    fn update_input_method_rewrites_only_the_key() {
+        let dir = test_dir("input-method");
+        let cfg = dir.join("config");
+        std::fs::write(
+            &cfg,
+            "input_method_extra = keep\nmode = auto\ninput_method = telex\nvn = \"x\"\n",
+        )
+        .unwrap();
+        update_input_method_at(&cfg, rustkey_core::telex::InputMethod::Vni);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            text,
+            "input_method_extra = keep\nmode = auto\ninput_method = vni\nvn = \"x\"\n"
+        );
+        assert!(!dir.join(".config.tmp").exists());
+
+        // Without the key, it is appended.
+        std::fs::write(&cfg, "mode = auto\n").unwrap();
+        update_input_method_at(&cfg, rustkey_core::telex::InputMethod::Telex);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(text, "mode = auto\ninput_method = telex\n");
+    }
+
+    #[test]
+    fn parses_advanced_settings() {
+        let text = "\
+input_method = vni
+remember_state_per_app = false
+enable_macro = true
+custom_words = \"this, test, github\"
+
+[macros]
+vn = \"Việt Nam\"
+hn = \"Hà Nội\"
+";
+        let c = parse(text);
+        assert_eq!(c.telex.input_method, telex::InputMethod::Vni);
+        assert!(!c.remember_state_per_app);
+        assert!(c.telex.enable_macro);
+        assert_eq!(c.telex.custom_words, vec!["this", "test", "github"]);
+        assert_eq!(
+            c.telex.macros.get("vn").map(|s| s.as_str()),
+            Some("Việt Nam")
+        );
+        assert_eq!(c.telex.macros.get("hn").map(|s| s.as_str()), Some("Hà Nội"));
+    }
+
+    #[test]
+    fn new_telex_and_capitalisation_keys_default_off_and_parse() {
+        let d = parse(DEFAULT_FILE);
+        assert!(!d.telex.simple_telex);
+        assert!(!d.telex.quick_telex);
+        assert!(!d.auto_capitalize);
+        let c = parse("simple_telex = true\nquick_telex = yes\nauto_capitalize = on");
+        assert!(c.telex.simple_telex);
+        assert!(c.telex.quick_telex);
+        assert!(c.auto_capitalize);
+    }
+
+    #[test]
+    fn app_mode_off_applies_to_that_app_only() {
+        let c = parse("mode = auto\n[app_modes]\n\"org.gnome.Terminal\" = off\n");
+        assert_eq!(c.mode_for_app(Some("org.gnome.Terminal")), Mode::Off);
+        assert_eq!(
+            c.mode_for_app(Some("org.gnome.Terminal.desktop")),
+            Mode::Off
+        );
+        assert_eq!(c.mode_for_app(Some("firefox")), Mode::Auto);
+        assert_eq!(c.mode, Mode::Auto);
+    }
+
+    #[test]
+    fn quotes_strip_one_pair_only() {
+        assert_eq!(unquote("\"a\""), "a");
+        assert_eq!(unquote("\"Nói \"hi\"\""), "Nói \"hi\"");
+        assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("auto"), "auto");
+        let c = parse("[macros]\n\"nh\" = \"Nói \"hi\"\"\n");
+        assert_eq!(
+            c.telex.macros.get("nh").map(|s| s.as_str()),
+            Some("Nói \"hi\"")
+        );
+        assert_eq!(parse("mode = auto").mode, Mode::Auto);
+        assert_eq!(parse("mode = \"auto\"").mode, Mode::Auto);
+        assert_eq!(parse("mode = \"preedit\"").mode, Mode::Preedit);
+    }
+
+    #[test]
+    fn global_mode_off_is_not_allowed() {
+        // Off is per app; a global `mode = off` means auto.
+        assert_eq!(parse("mode = off").mode, Mode::Auto);
+    }
+}

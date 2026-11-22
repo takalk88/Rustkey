@@ -1,0 +1,18 @@
+[package]
+name = "rustkey-linux"
+version = "0.2.2"
+edition = "2021"
+description = "Rustkey's IBus-protocol bus for GNOME, with the Vietnamese engine in-process"
+license = "MIT"
+publish = false
+
+[lib]
+name = "rustkey_linux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustkey-linux"
+path = "src/main.rs"
+
+[dependencies]
+rustkey-core = { path = "../rustkey-core" }

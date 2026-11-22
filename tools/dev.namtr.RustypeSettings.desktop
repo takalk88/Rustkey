@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Rustype Settings
+Name[vi]=Cài đặt Rustype
+Comment=Configure Rustype Vietnamese input method
+Comment[vi]=Cấu hình bộ gõ tiếng Việt Rustype
+Exec=rustype-settings
+Icon=dev.namtr.RustypeSettings
+Terminal=false
+Type=Application
+StartupNotify=true
+StartupWMClass=dev.namtr.RustypeSettings
+Categories=Settings;DesktopSettings;
+Keywords=Vietnamese;IME;IBus;Telex;VNI;Input;rustype;settings;
