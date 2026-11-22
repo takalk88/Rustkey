@@ -11,7 +11,8 @@ use crate::props::{
 };
 use crate::wire::{body_bool, body_str};
 use rustkey_core::telex::InputMethod;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -180,8 +181,14 @@ pub struct IBusService {
     app_states: HashMap<String, bool>,
     address: String,
     debug: bool,
+    /// Outputs held back until forwarded BackSpaces have landed in the client (Mode::Backspace):
+    /// a client handles forwarded keys later than a commit, so the commit must wait.
+    deferred: VecDeque<(Instant, String, Vec<Out>)>,
     pub exit_requested: bool,
 }
+
+/// How long a commit waits behind forwarded BackSpaces.
+const BACKSPACE_SETTLE: Duration = Duration::from_millis(12);
 
 impl IBusService {
     pub fn new(address: String) -> IBusService {
@@ -195,7 +202,24 @@ impl IBusService {
             app_states: HashMap::new(),
             address,
             debug: std::env::var_os("RUSTKEY_DEBUG").is_some(),
+            deferred: VecDeque::new(),
             exit_requested: false,
+        }
+    }
+
+    /// Time until the oldest held-back output is due, for the poll timeout.
+    pub fn next_deferred(&self) -> Option<Duration> {
+        self.deferred
+            .front()
+            .map(|d| d.0.saturating_duration_since(Instant::now()))
+    }
+
+    /// Sends the held-back outputs that are due, in order.
+    pub fn flush_deferred(&mut self, bus: &mut Bus) {
+        while self.deferred.front().is_some_and(|d| d.0 <= Instant::now()) {
+            if let Some((_, path, outs)) = self.deferred.pop_front() {
+                self.send_now(bus, &path, outs);
+            }
         }
     }
 
@@ -949,10 +973,31 @@ impl IBusService {
         }
     }
 
-    fn send_outs(&mut self, bus: &mut Bus, path: &str, outs: Vec<Out>) {
+    fn send_outs(&mut self, bus: &mut Bus, path: &str, mut outs: Vec<Out>) {
         if outs.is_empty() {
             return;
         }
+        let queued = self.deferred.iter().any(|d| d.1 == path);
+        let split = outs
+            .iter()
+            .position(|o| matches!(o, Out::ForwardBackspaces(_)))
+            .map(|i| i + 1)
+            .filter(|&i| i < outs.len());
+        if queued {
+            // Stay behind the held-back output of this context, or the order breaks.
+            let due = Instant::now() + BACKSPACE_SETTLE;
+            self.deferred.push_back((due, path.to_string(), outs));
+            return;
+        }
+        if let Some(i) = split {
+            let rest = outs.split_off(i);
+            let due = Instant::now() + BACKSPACE_SETTLE;
+            self.deferred.push_back((due, path.to_string(), rest));
+        }
+        self.send_now(bus, path, outs);
+    }
+
+    fn send_now(&mut self, bus: &mut Bus, path: &str, outs: Vec<Out>) {
         let Some(ctx) = self.ctxs.get_mut(path) else {
             return;
         };
@@ -996,6 +1041,27 @@ impl IBusService {
                         "iu",
                         &w.buf,
                     )
+                }
+                Out::ForwardBackspaces(n) => {
+                    // keycode 14 is evdev BackSpace; a press then a release, as ibus-bamboo does.
+                    let mut buf = Vec::new();
+                    for _ in 0..n {
+                        for state in [0u32, 1 << 30] {
+                            let mut w = Writer::new();
+                            w.u32(0xff08);
+                            w.u32(14);
+                            w.u32(state);
+                            buf.extend(bus.ibus_signal(
+                                &owner,
+                                path,
+                                IC_IFACE,
+                                "ForwardKeyEvent",
+                                "uuu",
+                                &w.buf,
+                            ));
+                        }
+                    }
+                    buf
                 }
                 Out::RequireSurrounding => {
                     bus.ibus_signal(&owner, path, IC_IFACE, "RequireSurroundingText", "", &[])

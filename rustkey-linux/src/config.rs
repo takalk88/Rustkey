@@ -13,6 +13,9 @@ pub(crate) enum Mode {
     Preedit,
     /// No underline where the app supports Surrounding Text; elsewhere it behaves like Preedit.
     Direct,
+    /// No underline anywhere but terminals: where the app reports no Surrounding Text, the engine
+    /// sends real BackSpace key events before each commit (like Unikey). Can flicker or race.
+    Backspace,
     /// Vietnamese is always off in this app, whatever was remembered for it. Only `[app_modes]`
     /// can say this.
     Off,
@@ -83,6 +86,8 @@ pub(crate) const DEFAULT_FILE: &str = "\
 # auto    : không gạch chân ở ứng dụng thường, gạch chân trong terminal (khuyên dùng)
 # preedit : luôn gạch chân
 # direct  : giống auto, giữ lại để không hỏng cấu hình cũ
+# backspace: không gạch chân ở mọi ứng dụng trừ terminal; app không báo Surrounding Text thì
+#            gửi phím Backspace thật rồi mới chèn chữ (như Unikey). Có thể nháy hoặc lệch chữ.
 mode = auto
 
 # false: hòa, khỏe, thúy   true: hoà, khoẻ, thuý
@@ -239,6 +244,7 @@ fn parse_mode(v: &str) -> Mode {
     match v.to_ascii_lowercase().as_str() {
         "preedit" => Mode::Preedit,
         "direct" => Mode::Direct,
+        "backspace" => Mode::Backspace,
         "off" => Mode::Off,
         _ => Mode::Auto,
     }

@@ -72,7 +72,12 @@ impl Server {
                 .peers
                 .values()
                 .any(|p| p.paused && p.pending() <= INPUT_PAUSE);
-            sys::poll_fds(&mut fds, if ready_backlog { 0 } else { POLL_MS })?;
+            let wait = match self.ibus.next_deferred() {
+                Some(d) => POLL_MS.min(d.as_millis() as i32 + 1),
+                None => POLL_MS,
+            };
+            sys::poll_fds(&mut fds, if ready_backlog { 0 } else { wait })?;
+            self.ibus.flush_deferred(&mut self.bus);
 
             if fds[0].revents & POLLIN != 0 {
                 self.accept_all();

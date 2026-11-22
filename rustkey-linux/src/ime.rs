@@ -43,6 +43,8 @@ pub enum Out {
         offset: i32,
         nchars: u32,
     },
+    /// Forward this many BackSpace key presses to the client (Mode::Backspace).
+    ForwardBackspaces(u32),
     /// Ask the client to report Surrounding Text (IBus RequireSurroundingText).
     RequireSurrounding,
     /// The Ctrl+Shift chord was completed: the service flips Vietnamese on or off, as the panel
@@ -54,6 +56,8 @@ pub enum Out {
 enum Show {
     Surrounding,
     Preedit,
+    /// No Surrounding Text and no underline: fake BackSpace keys, then a commit.
+    Backspace,
 }
 
 /// Ctrl+Shift toggle tracking. Fires once per chord, when one of the two keys is released after
@@ -517,6 +521,8 @@ impl Ime {
                     Mode::Preedit | Mode::Off => Show::Preedit,
                     Mode::Auto | Mode::Direct if surrounding => Show::Surrounding,
                     Mode::Auto | Mode::Direct => Show::Preedit,
+                    Mode::Backspace if surrounding => Show::Surrounding,
+                    Mode::Backspace => Show::Backspace,
                 }
             };
         }
@@ -531,6 +537,15 @@ impl Ime {
     fn replace(&mut self, backspaces: usize, text: String, out: &mut Vec<Out>) {
         // Mutter 46/47 aborts a delete past the caret it stores. A URL field whose report is
         // lagging keeps its delete: the repair handles a dropped one, as on GNOME 48+ today.
+        if self.show == Show::Backspace {
+            if backspaces > 0 {
+                out.push(Out::ForwardBackspaces(backspaces as u32));
+            }
+            if !text.is_empty() {
+                out.push(Out::Commit(text));
+            }
+            return;
+        }
         let lagging_url = self.purpose == PURPOSE_URL && self.reports_awaited > 0;
         if backspaces > 0 && (self.delete_fits(backspaces) || lagging_url) {
             out.push(Out::DeleteSurrounding {
@@ -771,7 +786,7 @@ impl Ime {
         }
         if show != Show::Preedit {
             let r = self.telex.backspace();
-            let plain = self.purpose != PURPOSE_URL;
+            let plain = self.purpose != PURPOSE_URL && show == Show::Surrounding;
             if plain && r.backspaces > 0 && !self.delete_fits(r.backspaces) {
                 // The app replaced the field, so the word is gone: the app erases the char itself.
                 self.telex.reset();
@@ -913,6 +928,18 @@ mod tests {
         assert!(!out
             .iter()
             .any(|o| matches!(o, Out::DeleteSurrounding { .. })));
+    }
+
+    #[test]
+    fn backspace_mode_forwards_backspaces_without_preedit() {
+        let cfg = crate::config::parse("mode = backspace\n");
+        let mut ime = Ime::new(&cfg);
+        ime.set_capabilities(0x9); // no surrounding text
+        let out = keys(&mut ime, "kieemr");
+        assert!(!out.iter().any(|o| matches!(o, Out::Preedit(_))));
+        assert!(out.contains(&Out::ForwardBackspaces(1)));
+        assert_eq!(out.last(), Some(&Out::Commit("ểm".into())));
+        assert_eq!(out[out.len() - 2], Out::ForwardBackspaces(2));
     }
 
     #[test]
